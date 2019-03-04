@@ -1,5 +1,9 @@
 package io.florentine;
 
+import java.security.NoSuchAlgorithmException;
+
+import javax.crypto.Mac;
+
 public enum MacAlgorithm {
     HS512("HmacSHA512");
 
@@ -9,11 +13,19 @@ public enum MacAlgorithm {
         this.macAlgorithm = macAlgorithm;
     }
 
+    Mac getMac() {
+        try {
+            return Mac.getInstance(macAlgorithm);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("JVM does not support this MAC algorithm: " + macAlgorithm, e);
+        }
+    }
+
     String getMacAlgorithm() {
         return macAlgorithm;
     }
 
-    String getKeyAlgorthm() { return macAlgorithm; }
+    String getKeyAlgorithm() { return macAlgorithm; }
 
     int getKeySizeBytes() {
         return 32;

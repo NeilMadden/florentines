@@ -1,121 +1,154 @@
 package io.florentine;
 
-import java.nio.charset.StandardCharsets;
+import static java.nio.charset.StandardCharsets.US_ASCII;
+
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.security.GeneralSecurityException;
-import java.security.Key;
+import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
-import java.security.MessageDigest;
-import java.security.interfaces.ECKey;
-import java.security.interfaces.XECKey;
-import java.security.spec.AlgorithmParameterSpec;
+import java.security.PublicKey;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.Arrays;
+import java.util.Base64;
 
-import javax.crypto.KeyAgreement;
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
-import javax.security.auth.DestroyFailedException;
+import javax.crypto.SecretKey;
 
 import org.json.JSONObject;
 
 public enum KdfAlgorithm {
     HKDF {
         @Override
-        Key[] deriveKeys(Key senderKey, Key recipientKey, JSONObject header, MacAlgorithm macAlgorithm,
-                EncAlgorithm encAlgorithm, byte[] additionalInfo) throws GeneralSecurityException {
-            if (recipientKey != null) {
+        SecretKey[] deriveKeys(FlorentineKey senderKey, FlorentineKey recipientKey, JSONObject header) {
+            if (recipientKey != null && recipientKey != senderKey) {
                 throw new IllegalArgumentException("HKDF does not support recipient keys");
             }
-            var hmac = Mac.getInstance(macAlgorithm.getMacAlgorithm());
-            assert hmac.getMacLength() >= macAlgorithm.getKeySizeBytes() + encAlgorithm.getKeySizeBytes();
-            hmac.init(senderKey);
 
-            String type = header.has("typ") ? header.getString("typ") : "";
-            String info = this.toString() + macAlgorithm.toString() + encAlgorithm.toString() + type;
-            hmac.update(info.getBytes(StandardCharsets.UTF_8));
-            if (additionalInfo != null) {
-                hmac.update(additionalInfo);
+            if (senderKey.getKdfAlgorithm() != HKDF) {
+                throw new IllegalArgumentException("Sender key not intended for HKDF");
             }
-            hmac.update((byte) 0);
-            var keyMaterial = hmac.doFinal();
 
-            var macKey = new SecretKeySpec(keyMaterial, 0, macAlgorithm.getKeySizeBytes(),
-                    macAlgorithm.getKeyAlgorthm());
-            var encKey = new SecretKeySpec(keyMaterial, 32, encAlgorithm.getKeySizeBytes(),
-                    encAlgorithm.getKeyAlgorithm());
+            var macAlgorithm = senderKey.getMacAlgorithm();
+            var encAlgorithm = senderKey.getEncAlgorithm();
 
-            Arrays.fill(keyMaterial, (byte) 0);
-
-            return new Key[] { macKey, encKey };
+            var otherInfo = KdfAlgorithm.otherInfo(this, macAlgorithm, encAlgorithm, header);
+            return io.florentine.HKDF.expand(senderKey.getSecretKey(), macAlgorithm, encAlgorithm, otherInfo);
         }
     },
-    ECDH_ESSS {
+    ECDH {
         @Override
-        Key[] deriveKeys(Key senderKey, Key recipientKey, JSONObject header, MacAlgorithm macAlgorithm,
-                EncAlgorithm encAlgorithm, byte[] additionalInfo) throws GeneralSecurityException {
+        SecretKey[] deriveKeys(FlorentineKey senderKey, FlorentineKey recipientKey, JSONObject header)
+                throws GeneralSecurityException {
 
             KeyPair ephemeralKeys = null;
+            SecretKey masterKey = null;
             byte[] ephemeralStaticSecret = new byte[0];
             byte[] staticStaticSecret = new byte[0];
 
+            var keyPairAlgorithm = senderKey.getPublicKey().getAlgorithm();
+            var keyAgreementAlgorithm = senderKey.getCurve().getKeyAgreementAlgorithm();
+
+            var macAlgorithm = recipientKey.getMacAlgorithm();
+            var encAlgorithm = recipientKey.getEncAlgorithm();
+
             try {
-                var keyPairGenerator = KeyPairGenerator.getInstance(senderKey.getAlgorithm());
-                keyPairGenerator.initialize(getParameterSpec(senderKey));
-                ephemeralKeys = keyPairGenerator.generateKeyPair();
+                if (senderKey.isSecret()) {
+                    var keyPairGenerator = KeyPairGenerator.getInstance(keyPairAlgorithm);
+                    keyPairGenerator.initialize(recipientKey.getCurve().getParameters());
+                    ephemeralKeys = keyPairGenerator.generateKeyPair();
 
-                // Ephemeral-static key agreement
-                var keyAgreement = KeyAgreement.getInstance(senderKey.getAlgorithm());
-                keyAgreement.init(ephemeralKeys.getPrivate());
-                keyAgreement.doPhase(recipientKey, true);
-                ephemeralStaticSecret = keyAgreement.generateSecret();
+                    header.put("epk",
+                            Base64.getUrlEncoder().withoutPadding().encodeToString(ephemeralKeys.getPublic().getEncoded()));
 
-                // Static-static key agreement
-                keyAgreement.init(senderKey);
-                keyAgreement.doPhase(recipientKey, true);
-                staticStaticSecret = keyAgreement.generateSecret();
+                    // Ephemeral-static key agreement
+                    ephemeralStaticSecret = Utils.ecdh(keyAgreementAlgorithm, ephemeralKeys.getPrivate(),
+                            recipientKey.getPublicKey());
 
-                var hmac = Mac.getInstance(macAlgorithm.getMacAlgorithm());
-                hmac.init(new SecretKeySpec(new byte[hmac.getMacLength()], macAlgorithm.getKeyAlgorthm()));
-                hmac.update(ephemeralStaticSecret);
-                hmac.update(staticStaticSecret);
+                    // Static-static key agreement
+                    staticStaticSecret = Utils.ecdh(keyAgreementAlgorithm, senderKey.getSecretKey(),
+                            recipientKey.getPublicKey());
+                } else {
+                    var keyFactory = KeyFactory.getInstance(keyPairAlgorithm);
+                    var encodedBytes = Base64.getUrlDecoder().decode(header.getString("epk"));
+                    var epk = keyFactory.generatePublic(new X509EncodedKeySpec(encodedBytes));
+                    ephemeralKeys = new KeyPair(epk, null);
 
-                MessageDigest hash = MessageDigest.getInstance("SHA-512");
-                hash.update(additionalInfo);
-                hash.update(ephemeralKeys.getPublic().getEncoded());
-                hash.update(recipientKey.getEncoded());
+                    ephemeralStaticSecret = Utils.ecdh(keyAgreementAlgorithm, recipientKey.getSecretKey(), epk);
 
-                var masterKey = new SecretKeySpec(hmac.doFinal(), macAlgorithm.getKeyAlgorthm());
-                return HKDF.deriveKeys(masterKey, null, header, macAlgorithm, encAlgorithm, hash.digest());
+                    staticStaticSecret = Utils.ecdh(keyAgreementAlgorithm, recipientKey.getSecretKey(),
+                            senderKey.getPublicKey());
+                }
+
+                masterKey = io.florentine.HKDF.extract(macAlgorithm, null, ephemeralStaticSecret,
+                        staticStaticSecret);
+
+                var otherInfo = KdfAlgorithm.otherInfo(this, macAlgorithm, encAlgorithm, header,
+                        senderKey.getPublicKey(), ephemeralKeys.getPublic(), recipientKey.getPublicKey());
+
+                return io.florentine.HKDF.expand(masterKey, macAlgorithm, encAlgorithm, otherInfo);
 
             } finally {
                 // Clean up any temporary key material
                 Arrays.fill(ephemeralStaticSecret, (byte) 0);
                 Arrays.fill(staticStaticSecret, (byte) 0);
                 if (ephemeralKeys != null) {
-                    try {
-                        ephemeralKeys.getPrivate().destroy();
-                    } catch (DestroyFailedException e) {
-                        // Ignore
-                    }
+                    Utils.destroyKeyMaterial(ephemeralKeys.getPrivate());
                 }
+                Utils.destroyKeyMaterial(masterKey);
             }
-        }
-
-        private AlgorithmParameterSpec getParameterSpec(Key key) {
-            if (key instanceof ECKey) {
-                return ((ECKey) key).getParams();
-            } else if (key instanceof XECKey) {
-                return ((XECKey) key).getParams();
-            }
-            throw new IllegalArgumentException("unrecognised key: " + key);
         }
     };
 
-    abstract Key[] deriveKeys(Key senderKey, Key recipientKey, JSONObject header, MacAlgorithm macAlgorithm,
-            EncAlgorithm encAlgorithm, byte[] additionalInfo) throws GeneralSecurityException;
+    abstract SecretKey[] deriveKeys(FlorentineKey sender, FlorentineKey recipient, JSONObject header)
+            throws GeneralSecurityException;
 
     @Override
     public String toString() {
         return name().replace('_', '-');
+    }
+
+    private static byte[] otherInfo(KdfAlgorithm kdfAlgorithm, MacAlgorithm macAlgorithm, EncAlgorithm encAlgorithm,
+            JSONObject header, PublicKey...publicKeys) {
+        try (var baos = new ByteArrayOutputStream();
+             var out = new DataOutputStream(baos)) {
+
+            var type = header.has("typ") ? header.getString("typ") : "";
+            var algHeader = ascii(kdfAlgorithm.toString(), macAlgorithm.toString(), encAlgorithm.toString(), type);
+
+            out.writeInt(algHeader.length);
+            out.write(algHeader);
+
+            out.writeInt(publicKeys.length);
+
+            for (PublicKey publicKey : publicKeys) {
+                var encoded = publicKey.getEncoded();
+                if (encoded == null) {
+                    throw new IllegalArgumentException("encoded public key is null: " + publicKey);
+                }
+                out.writeInt(encoded.length);
+                out.write(encoded);
+            }
+
+            out.writeInt((macAlgorithm.getKeySizeBytes() + encAlgorithm.getKeySizeBytes()) * 8);
+
+            out.flush();
+            return baos.toByteArray();
+        } catch (IOException e) {
+            throw new RuntimeException("Unable to build OtherInfo structure", e);
+        }
+    }
+
+    private static byte[] ascii(String...strings) {
+        var bytes = Arrays.stream(strings).map(s -> s.getBytes(US_ASCII)).toArray(byte[][]::new);
+        var size = Arrays.stream(bytes).mapToInt(b -> b.length).sum();
+        var buffer = new byte[size];
+        var i = 0;
+        for (var item : bytes) {
+            System.arraycopy(item, 0, buffer, i, item.length);
+            i += item.length;
+        }
+        return buffer;
     }
 }

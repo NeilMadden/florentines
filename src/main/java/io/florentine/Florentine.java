@@ -1,27 +1,29 @@
 package io.florentine;
 
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.security.GeneralSecurityException;
-import java.security.Key;
-import java.security.KeyPair;
-import java.security.PublicKey;
+import java.security.InvalidKeyException;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.List;
 
 import javax.crypto.Cipher;
 import javax.crypto.Mac;
-import javax.crypto.SecretKey;
-import javax.crypto.spec.SecretKeySpec;
 
 import org.json.JSONObject;
 
@@ -33,80 +35,226 @@ public final class Florentine {
     private final JSONObject header;
     private final List<Packet> contents;
     private final List<Packet> caveats;
-    private byte[] tag;
 
-    private final MacAlgorithm macAlgorithm;
-    private final EncAlgorithm encAlgorithm;
+    private byte[] tag;
+    private MacAlgorithm macAlgorithm;
+    private EncAlgorithm encAlgorithm;
 
     Florentine(Builder builder, byte[] tag) {
         this.header = builder.header;
         this.contents = Collections.unmodifiableList(builder.contents);
         this.caveats = new ArrayList<>();
         this.tag = tag;
-        this.macAlgorithm = builder.macAlgorithm;
-        this.encAlgorithm = builder.encAlgorithm;
+        this.macAlgorithm = builder.recipient.getMacAlgorithm();
+        this.encAlgorithm = builder.recipient.getEncAlgorithm();
+    }
+
+    Florentine(JSONObject header, List<Packet> contents, List<Packet> caveats, byte[] tag) {
+        this.header = header;
+        this.contents = Collections.unmodifiableList(contents);
+        this.caveats = caveats;
+        this.tag = tag;
     }
 
     public static Builder builder() {
         return new Builder();
     }
 
+    public Florentine withMacAlgorithm(MacAlgorithm macAlgorithm) {
+        this.macAlgorithm = macAlgorithm;
+        return this;
+    }
+
+    public Florentine withEncAlgorithm(EncAlgorithm encAlgorithm) {
+        this.encAlgorithm = encAlgorithm;
+        return this;
+    }
+
     public Florentine addCaveat(JSONObject caveat) {
+        if (macAlgorithm == null) {
+            throw new IllegalStateException("Unknown MAC algorithm - call withMacAlgorithm() first");
+        }
+        var packet = new Packet(PacketType.CAVEAT, caveat.toString());
+        this.tag = packet.authenticate(macAlgorithm.getMac(), this.tag);
+        caveats.add(packet);
+        return this;
+    }
+
+    public JSONObject getHeader() {
+        return header;
+    }
+
+    public Florentine expiresAt(Instant expiryTime) {
+        return addCaveat(new JSONObject().put("exp", expiryTime.getEpochSecond()));
+    }
+
+    public Florentine notBefore(Instant notBeforeTime) {
+        return addCaveat(new JSONObject().put("nbf", notBeforeTime.getEpochSecond()));
+    }
+
+    public Florentine confirmationKey(JSONObject confirmationKey) {
+        return addCaveat(new JSONObject().put("cnf", confirmationKey));
+    }
+
+    public static Florentine decode(String florentine) {
+        try (var in = BASE64URL_DECODER.wrap(new ByteArrayInputStream(florentine.getBytes(UTF_8)))) {
+            var packet = readPacket(in);
+            if (packet == null || packet.packetType != PacketType.HEADER) {
+                throw new IllegalArgumentException("missing header");
+            }
+            JSONObject header = new JSONObject(new String(packet.content, UTF_8));
+
+            var length = header.getInt("len");
+            var contents = new ArrayList<Packet>(length - 1);
+            for (var i = 0; i < length - 1; ++i) {
+                packet = readPacket(in);
+                if (packet == null) {
+                    throw new IllegalArgumentException("missing content packet");
+                }
+                if (packet.packetType != PacketType.PUBLIC && packet.packetType != PacketType.SECRET) {
+                    throw new IllegalArgumentException("unexpected packet type while reading contents: " + packet.packetType);
+                }
+                contents.add(packet);
+            }
+
+            var caveats = new ArrayList<Packet>();
+            packet = readPacket(in);
+
+            while (packet != null) {
+                if (packet.packetType == PacketType.MACTAG) {
+                    break;
+                }
+                if (packet.packetType != PacketType.CAVEAT) {
+                    throw new IllegalArgumentException("unexpected packet type while reading caveats: " + packet.packetType);
+                }
+                caveats.add(packet);
+                packet = readPacket(in);
+            }
+
+            if (packet == null) {
+                throw new IllegalArgumentException("missing authentication tag");
+            }
+            var tag = packet.content;
+
+            return new Florentine(header, contents, caveats, tag);
+
+        } catch (IOException | ArrayIndexOutOfBoundsException e) {
+            throw new IllegalArgumentException("invalid florentine", e);
+        }
+    }
+
+    public boolean verifySignature(FlorentineKey myKey, FlorentineKey senderKey) {
+        this.macAlgorithm = myKey.getMacAlgorithm();
+        this.encAlgorithm = myKey.getEncAlgorithm();
+
         try {
-            var mac = Mac.getInstance(macAlgorithm.getMacAlgorithm());
-            mac.init(new SecretKeySpec(tag, 0, macAlgorithm.getKeySizeBytes(), macAlgorithm.getKeyAlgorthm()));
-            var newTag = mac.doFinal(caveat.toString().getBytes(UTF_8));
+            var messageKeys = myKey.getKdfAlgorithm().deriveKeys(senderKey, myKey, header);
+            var macKey = messageKeys[0];
+            var encKey = messageKeys[1];
 
-            caveats.add(new Packet(PacketType.CAVEAT, caveat.toString()));
-            Arrays.fill(this.tag, (byte)0);
-            this.tag = newTag;
+            var mac = macAlgorithm.getMac();
+            mac.init(macKey);
+            var tag = mac.doFinal(encodeLength(header.getInt("len")));
 
-            return this;
+            for (var packet : allPackets()) {
+                if (packet.packetType.isEncrypted()) {
+                    if (packet.siv == null) {
+                        throw new IllegalArgumentException("missing SIV for encrypted packet");
+                    }
+                    var cipher = encAlgorithm.getCipher(Cipher.DECRYPT_MODE, encKey, packet.siv);
+                    cipher.doFinal(packet.content, 0, packet.content.length, packet.content);
+                }
+
+                tag = packet.authenticate(mac, tag);
+            }
+
+            return MessageDigest.isEqual(tag, this.tag);
+
         } catch (GeneralSecurityException e) {
             throw new RuntimeException(e);
+        }
+    }
+
+    private static Packet readPacket(InputStream in) throws IOException {
+        var nextByte = in.read();
+        if (nextByte == -1) {
+            return null;
+        }
+        var packetType = PacketType.valueOf((byte) nextByte);
+        var packetLength = in.read() | (in.read() << 8);
+        if (packetLength < 0 || packetLength > 65535) {
+            throw new IllegalArgumentException("invalid packet length");
+        }
+        var content = in.readNBytes(packetLength);
+        if (content.length != packetLength) {
+            throw new IOException("failed to read correctly sized packet");
+        }
+        byte[] siv = null;
+        if (packetType.isEncrypted()) {
+            var sivLen = in.read() | (in.read() << 8);
+            if (sivLen < 0 || sivLen > 32) {
+                throw new IllegalArgumentException("invalid siv length");
+            }
+            siv = in.readNBytes(sivLen);
+            if (siv.length != sivLen) {
+                throw new IOException("failed to read correctly sized SIV");
+            }
+        }
+        var packet = new Packet(packetType, content);
+        packet.siv = siv;
+        return packet;
+    }
+
+    public void writeTo(OutputStream outputStream) throws IOException {
+        try (var out = BASE64URL_ENCODER.wrap(new UncloseableOutputStream(outputStream))) {
+            for (Packet packet : allPackets()) {
+                out.write(packet.packetType.getPacketIndicator());
+                out.write(encodeLength(packet.content.length));
+                out.write(packet.content);
+                if (packet.packetType.isEncrypted()) {
+                    out.write(encodeLength(packet.siv.length));
+                    out.write(packet.siv);
+                }
+            }
+
+            out.write(PacketType.MACTAG.getPacketIndicator());
+            out.write(encodeLength(tag.length));
+            out.write(tag);
+        }
+    }
+
+    private static class UncloseableOutputStream extends FilterOutputStream {
+        UncloseableOutputStream(OutputStream out) {
+            super(out);
+        }
+
+        @Override
+        public void close() throws IOException {
+            // Only flush, don't close
+            super.flush();
         }
     }
 
     @Override
     public String toString() {
         try (var out = new ByteArrayOutputStream()) {
-            for (Packet packet : allPackets()) {
-                out.write(packet.packetType.ordinal());
-                out.write(encodeLength(packet.content.length));
-                out.write(packet.content);
-            }
-
-            return BASE64URL_ENCODER.encodeToString(out.toByteArray());
+            writeTo(out);
+            return new String(out.toByteArray(), US_ASCII);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
     private Iterable<Packet> allPackets() {
-        return () -> {
-            Iterator<Packet> it1 = Collections.singleton(new Packet(PacketType.HEADER, header.toString())).iterator();
-            Iterator<Packet> it2 = contents.iterator();
-            Iterator<Packet> it3 = caveats.iterator();
-
-            return new Iterator<>() {
-                @Override
-                public boolean hasNext() {
-                    return it1.hasNext() || it2.hasNext() || it3.hasNext();
-                }
-
-                @Override
-                public Packet next() {
-                    return it1.hasNext() ? it1.next() : it2.hasNext() ? it2.next() : it3.next();
-                }
-            };
-        };
+        var headerPacket = Collections.singleton(new Packet(PacketType.HEADER, header.toString()));
+        return Utils.concat(headerPacket, contents, caveats);
     }
 
     private static byte[] encodeLength(int length) {
         if (length < 0 || length > 65535) {
             throw new IllegalArgumentException("length cannot be represented in 16 bits");
         }
-        return Arrays.copyOf(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(length).array(), 2);
+        return ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort((short) length).array();
     }
 
     public static class Builder {
@@ -114,14 +262,8 @@ public final class Florentine {
                 .put("uid", randomString());
         private final List<Packet> contents = new ArrayList<>();
 
-        private KdfAlgorithm kdfAlgorithm = KdfAlgorithm.HKDF;
-        private MacAlgorithm macAlgorithm = MacAlgorithm.HS512;
-        private EncAlgorithm encAlgorithm = EncAlgorithm.A256SIV;
-
-        public Builder keyId(String keyId) {
-            header.put("kid", keyId);
-            return this;
-        }
+        private FlorentineKey recipient;
+        private FlorentineKey sender;
 
         public Builder type(String type) {
             header.put("typ", type);
@@ -138,23 +280,8 @@ public final class Florentine {
             return this;
         }
 
-        public Builder audience(String... audience) {
-            header.put("aud", Arrays.asList(audience));
-            return this;
-        }
-
         public Builder issuer(String issuer) {
             header.put("iss", issuer);
-            return this;
-        }
-
-        public Builder crit(String... criticalHeaders) {
-            header.put("crit", Arrays.asList(criticalHeaders));
-            return this;
-        }
-
-        public Builder epk(JSONObject ephemeralKey) {
-            header.put("epk", ephemeralKey);
             return this;
         }
 
@@ -194,47 +321,61 @@ public final class Florentine {
             return addSecret(content.toString());
         }
 
-        public Florentine buildPublic(KeyPair senderKeys, PublicKey recipientKey) {
-            try {
-                Key[] keys = kdfAlgorithm.deriveKeys(senderKeys.getPrivate(), recipientKey, header, macAlgorithm,
-                        encAlgorithm, senderKeys.getPublic().getEncoded());
-                return build(keys[0], keys[1]);
-            } catch (GeneralSecurityException e) {
-                throw new RuntimeException(e);
-            }
+        public Builder to(FlorentineKey recipient) {
+            this.recipient = recipient;
+            header.put("kid", recipient.getKeyId());
+            return this;
         }
 
-        public Florentine buildSecret(SecretKey secretKey) {
-            try {
-                Key[] keys = kdfAlgorithm.deriveKeys(secretKey, null, header, macAlgorithm, encAlgorithm, null);
-                return build(keys[0], keys[1]);
-            } catch (GeneralSecurityException e) {
-                throw new RuntimeException(e);
+        public Builder from(FlorentineKey sender) {
+            this.sender = sender;
+            if (recipient == null) {
+                return to(sender);
             }
+            return this;
         }
 
-        private Florentine build(Key macKey, Key encKey) throws GeneralSecurityException {
-            var mac = Mac.getInstance(macAlgorithm.getMacAlgorithm());
-            mac.init(macKey);
+        public Florentine build() throws GeneralSecurityException {
+            if (sender == null) { throw new IllegalStateException("no sender key specified"); }
+            if (recipient == null) { throw new IllegalStateException("no recipient key specified"); }
 
-            var tag = mac.doFinal(encodeLength(contents.size() + 1));
-            Iterator<Packet> packets = contents.iterator();
-            Packet packet = new Packet(PacketType.HEADER, header.toString());
+            if (sender.getKdfAlgorithm() != recipient.getKdfAlgorithm()) {
+                throw new IllegalStateException("sender and recipient use incompatible KDF algorithms");
+            }
 
-            for (; packets.hasNext(); packet = packets.next()) {
-                mac.init(new SecretKeySpec(tag, 0, macAlgorithm.getKeySizeBytes(), macAlgorithm.getKeyAlgorthm()));
-                mac.update((byte) packet.packetType.ordinal());
-                mac.update(encodeLength(packet.content.length));
-                mac.update(packet.content);
-                tag = mac.doFinal();
+            var kdfAlgorithm = recipient.getKdfAlgorithm();
+            var macAlgorithm = recipient.getMacAlgorithm();
+            var encAlgorithm = recipient.getEncAlgorithm();
 
-                if (packet.packetType.isEncrypted()) {
-                    var cipher = encAlgorithm.getCipher(Cipher.ENCRYPT_MODE, encKey, tag);
-                    cipher.doFinal(packet.content, 0, packet.content.length, packet.content);
+            var messageKeys = kdfAlgorithm.deriveKeys(sender, recipient, header);
+            var macKey = messageKeys[0];
+            var encKey = messageKeys[1];
+
+            try {
+                var mac = macAlgorithm.getMac();
+                mac.init(macKey);
+                var len = contents.size() + 1;
+                header.put("len", len);
+
+                var tag = mac.doFinal(encodeLength(len));
+                var headerPacket = new Packet(PacketType.HEADER, header.toString());
+                tag = headerPacket.authenticate(mac, tag);
+
+                for (var packet : contents) {
+                    tag = packet.authenticate(mac, tag);
+
+                    if (packet.packetType.isEncrypted()) {
+                        var cipher = encAlgorithm.getCipher(Cipher.ENCRYPT_MODE, encKey,
+                                Arrays.copyOfRange(tag, 32, tag.length));
+                        packet.siv = cipher.getIV();
+                        cipher.doFinal(packet.content, 0, packet.content.length, packet.content);
+                    }
                 }
-            }
 
-            return new Florentine(this, tag);
+                return new Florentine(this, tag);
+            } finally {
+                Utils.destroyKeyMaterial(macKey, encKey);
+            }
         }
     }
 
@@ -248,16 +389,30 @@ public final class Florentine {
         HEADER,
         PUBLIC,
         SECRET,
-        CAVEAT;
+        CAVEAT,
+        MACTAG;
 
         boolean isEncrypted() {
             return this == SECRET;
+        }
+        byte getPacketIndicator() {
+            return (byte) name().charAt(0);
+        }
+
+        static PacketType valueOf(byte indicator) {
+            for (var candidate : values()) {
+                if (candidate.getPacketIndicator() == indicator) {
+                    return candidate;
+                }
+            }
+            throw new IllegalArgumentException("unknown packet type");
         }
     }
 
     private static class Packet {
         private final PacketType packetType;
         private final byte[] content;
+        private byte[] siv;
 
         Packet(PacketType packetType, byte[] content) {
             this.packetType = packetType;
@@ -266,6 +421,21 @@ public final class Florentine {
 
         Packet(PacketType packetType, String content) {
             this(packetType, content.getBytes(UTF_8));
+        }
+
+        byte[] authenticate(Mac mac, byte[] oldTag) {
+            var key = new DestroyableSecretKey(oldTag, 0, mac.getMacLength(), mac.getAlgorithm());
+            try {
+                mac.init(key);
+                mac.update(packetType.getPacketIndicator());
+                mac.update(encodeLength(content.length));
+                mac.update(content);
+                return mac.doFinal();
+            } catch (InvalidKeyException e) {
+                throw new IllegalStateException(e);
+            } finally {
+                Utils.destroyKeyMaterial(key);
+            }
         }
     }
 }

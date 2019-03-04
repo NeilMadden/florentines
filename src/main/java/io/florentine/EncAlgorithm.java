@@ -12,7 +12,7 @@ import javax.crypto.NoSuchPaddingException;
 import javax.crypto.spec.IvParameterSpec;
 
 public enum EncAlgorithm {
-    A256SIV("AES/CTR/NoPadding", tag -> new IvParameterSpec(tag, 32, 16));
+    A256SIV("AES/CTR/NoPadding", tag -> new IvParameterSpec(tag, 0, 16));
 
     final String cipherAlgorithm;
     final Function<byte[], AlgorithmParameterSpec> parameterSpecFunction;
