@@ -31,14 +31,6 @@ final class Utils {
         };
     }
 
-    static byte[] ecdh(String keyAgreementAlgorithm, Key secretKey, PublicKey publicKey)
-            throws GeneralSecurityException {
-        var keyAgreement = KeyAgreement.getInstance(keyAgreementAlgorithm);
-        keyAgreement.init(secretKey);
-        keyAgreement.doPhase(publicKey, true);
-        return keyAgreement.generateSecret();
-    }
-
     static void destroyKeyMaterial(Destroyable... keys) {
         for (Destroyable key : keys) {
             if (key != null) {
@@ -48,20 +40,6 @@ final class Utils {
                     // Ignore
                 }
             }
-        }
-    }
-
-    static byte[] sha512(byte[]...inputs) {
-        try {
-            var hash = MessageDigest.getInstance("SHA-512");
-
-            for (byte[] input : inputs) {
-                hash.update(input);
-            }
-
-            return hash.digest();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-512 not available", e);
         }
     }
 }

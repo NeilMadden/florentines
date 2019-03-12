@@ -149,8 +149,8 @@ public final class Florentine {
 
         try {
             var messageKeys = myKey.getKdfAlgorithm().deriveKeys(senderKey, myKey, header);
-            var macKey = messageKeys[0];
-            var encKey = messageKeys[1];
+            var macKey = messageKeys.getMacKey();
+            var encKey = messageKeys.getEncKey();
 
             var mac = macAlgorithm.getMac();
             mac.init(macKey);
@@ -348,8 +348,8 @@ public final class Florentine {
             var encAlgorithm = recipient.getEncAlgorithm();
 
             var messageKeys = kdfAlgorithm.deriveKeys(sender, recipient, header);
-            var macKey = messageKeys[0];
-            var encKey = messageKeys[1];
+            var macKey = messageKeys.getMacKey();
+            var encKey = messageKeys.getEncKey();
 
             try {
                 var mac = macAlgorithm.getMac();

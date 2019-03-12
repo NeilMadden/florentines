@@ -74,6 +74,10 @@ public enum Curve {
         return this == X25519 || this == X448 ? "XDH" : "ECDH";
     }
 
+    public String getKeyAlgorithm() {
+        return this == X25519 || this == X448 ? "XDH" : "EC";
+    }
+
     @Override
     public String toString() {
         return name().replace('_', '-');
