@@ -12,24 +12,19 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.security.GeneralSecurityException;
-import java.security.InvalidKeyException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
 
 import javax.crypto.Cipher;
-import javax.crypto.Mac;
 
 import org.json.JSONObject;
 
 public final class Florentine {
-    private static final Base64.Encoder BASE64URL_ENCODER = Base64.getUrlEncoder().withoutPadding();
-    private static final Base64.Decoder BASE64URL_DECODER = Base64.getUrlDecoder();
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
     private final JSONObject header;
@@ -75,7 +70,7 @@ public final class Florentine {
             throw new IllegalStateException("Unknown MAC algorithm - call withMacAlgorithm() first");
         }
         var packet = new Packet(PacketType.CAVEAT, caveat.toString());
-        this.tag = packet.authenticate(macAlgorithm.getMac(), this.tag);
+        this.tag = macAlgorithm.authenticate(this.tag, packet.serialise());
         caveats.add(packet);
         return this;
     }
@@ -97,7 +92,7 @@ public final class Florentine {
     }
 
     public static Florentine decode(String florentine) {
-        try (var in = BASE64URL_DECODER.wrap(new ByteArrayInputStream(florentine.getBytes(UTF_8)))) {
+        try (var in = Base64url.wrap(new ByteArrayInputStream(florentine.getBytes(UTF_8)))) {
             var packet = readPacket(in);
             if (packet == null || packet.packetType != PacketType.HEADER) {
                 throw new IllegalArgumentException("missing header");
@@ -152,9 +147,7 @@ public final class Florentine {
             var macKey = messageKeys.getMacKey();
             var encKey = messageKeys.getEncKey();
 
-            var mac = macAlgorithm.getMac();
-            mac.init(macKey);
-            var tag = mac.doFinal(encodeLength(header.getInt("len")));
+            var tag = macAlgorithm.authenticate(macKey, encodeLength(header.getInt("len")));
 
             for (var packet : allPackets()) {
                 if (packet.packetType.isEncrypted()) {
@@ -165,7 +158,7 @@ public final class Florentine {
                     cipher.doFinal(packet.content, 0, packet.content.length, packet.content);
                 }
 
-                tag = packet.authenticate(mac, tag);
+                tag = macAlgorithm.authenticate(tag, packet.serialise());
             }
 
             return MessageDigest.isEqual(tag, this.tag);
@@ -206,7 +199,7 @@ public final class Florentine {
     }
 
     public void writeTo(OutputStream outputStream) throws IOException {
-        try (var out = BASE64URL_ENCODER.wrap(new UncloseableOutputStream(outputStream))) {
+        try (var out = Base64url.wrap(new UncloseableOutputStream(outputStream))) {
             for (Packet packet : allPackets()) {
                 out.write(packet.packetType.getPacketIndicator());
                 out.write(encodeLength(packet.content.length));
@@ -352,17 +345,15 @@ public final class Florentine {
             var encKey = messageKeys.getEncKey();
 
             try {
-                var mac = macAlgorithm.getMac();
-                mac.init(macKey);
                 var len = contents.size() + 1;
                 header.put("len", len);
 
-                var tag = mac.doFinal(encodeLength(len));
+                var tag = macAlgorithm.authenticate(macKey, encodeLength(len));
                 var headerPacket = new Packet(PacketType.HEADER, header.toString());
-                tag = headerPacket.authenticate(mac, tag);
+                tag = macAlgorithm.authenticate(tag, headerPacket.serialise());
 
                 for (var packet : contents) {
-                    tag = packet.authenticate(mac, tag);
+                    tag = macAlgorithm.authenticate(tag, packet.serialise());
 
                     if (packet.packetType.isEncrypted()) {
                         var cipher = encAlgorithm.getCipher(Cipher.ENCRYPT_MODE, encKey,
@@ -382,7 +373,7 @@ public final class Florentine {
     private static String randomString() {
         var buffer = new byte[20];
         SECURE_RANDOM.nextBytes(buffer);
-        return BASE64URL_ENCODER.encodeToString(buffer);
+        return Base64url.encode(buffer);
     }
 
     private enum PacketType {
@@ -423,19 +414,14 @@ public final class Florentine {
             this(packetType, content.getBytes(UTF_8));
         }
 
-        byte[] authenticate(Mac mac, byte[] oldTag) {
-            var key = new DestroyableSecretKey(oldTag, 0, mac.getMacLength(), mac.getAlgorithm());
-            try {
-                mac.init(key);
-                mac.update(packetType.getPacketIndicator());
-                mac.update(encodeLength(content.length));
-                mac.update(content);
-                return mac.doFinal();
-            } catch (InvalidKeyException e) {
-                throw new IllegalStateException(e);
-            } finally {
-                Utils.destroyKeyMaterial(key);
-            }
+        byte[] serialise() {
+            byte[] packet = new byte[3 + content.length];
+            packet[0] = packetType.getPacketIndicator();
+            byte[] len = encodeLength(content.length);
+            packet[1] = len[0];
+            packet[2] = len[1];
+            System.arraycopy(content, 0, packet, 3, content.length);
+            return packet;
         }
     }
 }

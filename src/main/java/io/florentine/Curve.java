@@ -1,16 +1,23 @@
 package io.florentine;
 
+import java.math.BigInteger;
 import java.security.AlgorithmParameters;
 import java.security.Key;
+import java.security.KeyFactory;
 import java.security.NoSuchAlgorithmException;
+import java.security.PublicKey;
 import java.security.interfaces.ECKey;
 import java.security.interfaces.XECKey;
 import java.security.spec.AlgorithmParameterSpec;
 import java.security.spec.ECGenParameterSpec;
 import java.security.spec.ECParameterSpec;
+import java.security.spec.ECPoint;
+import java.security.spec.ECPublicKeySpec;
+import java.security.spec.InvalidKeySpecException;
 import java.security.spec.InvalidParameterSpecException;
+import java.security.spec.KeySpec;
 import java.security.spec.NamedParameterSpec;
-import java.util.Optional;
+import java.security.spec.XECPublicKeySpec;
 
 public enum Curve {
     P_256("secp256r1"),
@@ -35,18 +42,11 @@ public enum Curve {
         this.parameters = parameters;
     }
 
-    public AlgorithmParameterSpec getParameters() {
+    AlgorithmParameterSpec getParameters() {
         return parameters;
     }
 
-    public <T extends AlgorithmParameterSpec> Optional<T> getParameters(Class<T> specType) {
-        if (specType.isInstance(parameters)) {
-            return Optional.of(specType.cast(parameters));
-        }
-        return Optional.empty();
-    }
-
-    public static Curve forKey(Key key) {
+    static Curve forKey(Key key) {
         if (key instanceof ECKey) {
             for (Curve candidate : values()) {
                 if (candidate.parameters.equals(((ECKey) key).getParams())) {
@@ -70,12 +70,29 @@ public enum Curve {
         return null;
     }
 
-    public String getKeyAgreementAlgorithm() {
-        return this == X25519 || this == X448 ? "XDH" : "ECDH";
+    String getKeyAlgorithm() {
+        return this == X25519 || this == X448 ? "XDH" : "EC";
     }
 
-    public String getKeyAlgorithm() {
-        return this == X25519 || this == X448 ? "XDH" : "EC";
+    PublicKey generatePublic(byte[] x, byte[] y) {
+        try {
+            var keyFactory = KeyFactory.getInstance(getKeyAlgorithm());
+            return keyFactory.generatePublic(getPublicKeySpec(x, y));
+        } catch (NoSuchAlgorithmException | InvalidKeySpecException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    KeySpec getPublicKeySpec(byte[] x, byte[] y) {
+        if (this == X25519 || this == X448) {
+            assert y == null;
+            var u = new BigInteger(1, Utils.reverse(x));
+            return new XECPublicKeySpec(getParameters(), u);
+        } else {
+            assert y != null;
+            ECPoint w = new ECPoint(new BigInteger(1, x), new BigInteger(1, y));
+            return new ECPublicKeySpec(w, (ECParameterSpec) getParameters());
+        }
     }
 
     @Override

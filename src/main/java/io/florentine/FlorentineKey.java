@@ -158,6 +158,34 @@ public class FlorentineKey {
             return this;
         }
 
+        public Builder fromPublicClaims(JSONObject publicClaims) {
+            var curve = Curve.valueOf(publicClaims.getString("crv"));
+
+            byte[] x = Base64url.decode(publicClaims.getString("x"));
+            byte[] y = null;
+            if (publicClaims.has("y")) {
+                y = Base64url.decode(publicClaims.getString("y"));
+            }
+
+            if (publicClaims.has("kdf")) {
+                kdf(KdfAlgorithm.valueOf(publicClaims.getString("kdf").replace('-', '_')));
+            }
+
+            if (publicClaims.has("mac")) {
+                mac(MacAlgorithm.valueOf(publicClaims.getString("mac")));
+            }
+
+            if (publicClaims.has("enc")) {
+                enc(EncAlgorithm.valueOf(publicClaims.getString("enc")));
+            }
+
+            return publicKey(curve.generatePublic(x, y));
+        }
+
+        public Builder fromSecretClaims(JSONObject secretClaims) {
+            return secretKey(Base64url.decode(secretClaims.getString("k")));
+        }
+
         public FlorentineKey build() {
             return new FlorentineKey(this);
         }

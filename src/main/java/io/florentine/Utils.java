@@ -1,13 +1,7 @@
 package io.florentine;
 
-import java.security.GeneralSecurityException;
-import java.security.Key;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.security.PublicKey;
 import java.util.Iterator;
 
-import javax.crypto.KeyAgreement;
 import javax.security.auth.DestroyFailedException;
 import javax.security.auth.Destroyable;
 
@@ -41,5 +35,15 @@ final class Utils {
                 }
             }
         }
+    }
+
+    static byte[] reverse(byte[] x) {
+        var y = new byte[x.length];
+        var len = x.length;
+        for (int i = 0; i < (len >>> 1); ++i) {
+            y[i] = x[len - i + 1];
+            y[len - i + 1] = x[i];
+        }
+        return y;
     }
 }
