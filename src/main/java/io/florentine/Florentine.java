@@ -20,8 +20,6 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
-import javax.crypto.Cipher;
-
 import org.json.JSONObject;
 
 public final class Florentine {
@@ -39,7 +37,7 @@ public final class Florentine {
         this.header = builder.header;
         this.contents = Collections.unmodifiableList(builder.contents);
         this.caveats = new ArrayList<>();
-        this.tag = tag;
+        this.tag = Arrays.copyOf(tag, builder.recipient.getMacAlgorithm().getKeySizeBytes());
         this.macAlgorithm = builder.recipient.getMacAlgorithm();
         this.encAlgorithm = builder.recipient.getEncAlgorithm();
     }
@@ -70,7 +68,8 @@ public final class Florentine {
             throw new IllegalStateException("Unknown MAC algorithm - call withMacAlgorithm() first");
         }
         var packet = new Packet(PacketType.CAVEAT, caveat.toString());
-        this.tag = macAlgorithm.authenticate(this.tag, packet.serialise());
+        this.tag = Arrays.copyOf(macAlgorithm.authenticate(this.tag, packet.serialise()),
+                macAlgorithm.getKeySizeBytes());
         caveats.add(packet);
         return this;
     }
@@ -142,6 +141,8 @@ public final class Florentine {
         this.macAlgorithm = myKey.getMacAlgorithm();
         this.encAlgorithm = myKey.getEncAlgorithm();
 
+        boolean isSafeToReleasePlaintext = false;
+
         try {
             var messageKeys = myKey.getKdfAlgorithm().deriveKeys(senderKey, myKey, header);
             var macKey = messageKeys.getMacKey();
@@ -154,17 +155,33 @@ public final class Florentine {
                     if (packet.siv == null) {
                         throw new IllegalArgumentException("missing SIV for encrypted packet");
                     }
-                    var cipher = encAlgorithm.getCipher(Cipher.DECRYPT_MODE, encKey, packet.siv);
-                    cipher.doFinal(packet.content, 0, packet.content.length, packet.content);
+                    encAlgorithm.decrypt(encKey, packet);
                 }
 
                 tag = macAlgorithm.authenticate(tag, packet.serialise());
+
+                // If the packet is encrypted then verify the SIV tag immediately and blow away any previously
+                // decrypted plaintext if it does not match
+                if (packet.packetType.isEncrypted() &&
+                        !MessageDigest.isEqual(packet.siv, Arrays.copyOfRange(tag, 32, tag.length))) {
+                    return false;
+                }
             }
 
-            return MessageDigest.isEqual(tag, this.tag);
+            tag = Arrays.copyOf(tag, macAlgorithm.getKeySizeBytes());
+            isSafeToReleasePlaintext = MessageDigest.isEqual(tag, this.tag);
+            return isSafeToReleasePlaintext;
 
         } catch (GeneralSecurityException e) {
             throw new RuntimeException(e);
+        } finally {
+            if (!isSafeToReleasePlaintext) {
+                // Something went wrong in either the signature verification or SIV verification - blow away all
+                // packets to avoid releasing unverified plaintext
+                for (Packet p : contents) {
+                    Arrays.fill(p.content, (byte) 0);
+                }
+            }
         }
     }
 
@@ -201,18 +218,14 @@ public final class Florentine {
     public void writeTo(OutputStream outputStream) throws IOException {
         try (var out = Base64url.wrap(new UncloseableOutputStream(outputStream))) {
             for (Packet packet : allPackets()) {
-                out.write(packet.packetType.getPacketIndicator());
-                out.write(encodeLength(packet.content.length));
-                out.write(packet.content);
+                out.write(packet.serialise());
                 if (packet.packetType.isEncrypted()) {
                     out.write(encodeLength(packet.siv.length));
                     out.write(packet.siv);
                 }
             }
 
-            out.write(PacketType.MACTAG.getPacketIndicator());
-            out.write(encodeLength(tag.length));
-            out.write(tag);
+            out.write(new Packet(PacketType.MACTAG, tag).serialise());
         }
     }
 
@@ -356,10 +369,9 @@ public final class Florentine {
                     tag = macAlgorithm.authenticate(tag, packet.serialise());
 
                     if (packet.packetType.isEncrypted()) {
-                        var cipher = encAlgorithm.getCipher(Cipher.ENCRYPT_MODE, encKey,
-                                Arrays.copyOfRange(tag, 32, tag.length));
-                        packet.siv = cipher.getIV();
-                        cipher.doFinal(packet.content, 0, packet.content.length, packet.content);
+                        // SIV is the second-half of the auth tag (which will otherwise be discarded)
+                        packet.siv = Arrays.copyOfRange(tag, 32, tag.length);
+                        encAlgorithm.encrypt(encKey, packet);
                     }
                 }
 
@@ -376,34 +388,52 @@ public final class Florentine {
         return Base64url.encode(buffer);
     }
 
-    private enum PacketType {
-        HEADER,
-        PUBLIC,
-        SECRET,
-        CAVEAT,
-        MACTAG;
+    enum PacketType {
+        /**
+         * Header packet is JSON object containing header fields. Must be the first packet.
+         */
+        HEADER('H'),
+        /**
+         * Packet contains public data/claims that are authenticated.
+         */
+        PUBLIC('P'),
+        /**
+         * Secret packets are encrypted using misuse-resistant authenticated encryption.
+         */
+        SECRET('S'),
+        /**
+         * A caveat packet is a JSON object containing caveats restricting authority granted in previous packets.
+         */
+        CAVEAT('C'),
+        /**
+         * The MAC tag packet is the final packet and contains the final MAC authentication tag.
+         */
+        MACTAG('T');
+
+        private final byte indicator;
+
+        PacketType(char indicator) {
+            this.indicator = (byte) indicator;
+        }
 
         boolean isEncrypted() {
             return this == SECRET;
         }
-        byte getPacketIndicator() {
-            return (byte) name().charAt(0);
-        }
 
         static PacketType valueOf(byte indicator) {
             for (var candidate : values()) {
-                if (candidate.getPacketIndicator() == indicator) {
+                if (candidate.indicator == indicator) {
                     return candidate;
                 }
             }
-            throw new IllegalArgumentException("unknown packet type");
+            throw new IllegalArgumentException("unknown packet type: " + (char) indicator);
         }
     }
 
-    private static class Packet {
-        private final PacketType packetType;
-        private final byte[] content;
-        private byte[] siv;
+    static class Packet {
+        final PacketType packetType;
+        final byte[] content;
+        byte[] siv;
 
         Packet(PacketType packetType, byte[] content) {
             this.packetType = packetType;
@@ -416,12 +446,16 @@ public final class Florentine {
 
         byte[] serialise() {
             byte[] packet = new byte[3 + content.length];
-            packet[0] = packetType.getPacketIndicator();
-            byte[] len = encodeLength(content.length);
-            packet[1] = len[0];
-            packet[2] = len[1];
-            System.arraycopy(content, 0, packet, 3, content.length);
+            ByteBuffer buffer = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN);
+            buffer.put(packetType.indicator);
+            buffer.putShort((short) content.length);
+            buffer.put(content);
             return packet;
+        }
+
+        @Override
+        public String toString() {
+            return "Packet{packetType=" + packetType + '}';
         }
     }
 }

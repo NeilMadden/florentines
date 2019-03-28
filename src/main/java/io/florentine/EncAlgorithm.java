@@ -1,15 +1,12 @@
 package io.florentine;
 
-import java.security.InvalidAlgorithmParameterException;
-import java.security.InvalidKeyException;
 import java.security.Key;
-import java.security.NoSuchAlgorithmException;
 import java.security.spec.AlgorithmParameterSpec;
 import java.util.function.Function;
 
-import javax.crypto.Cipher;
-import javax.crypto.NoSuchPaddingException;
 import javax.crypto.spec.IvParameterSpec;
+
+import io.florentine.Florentine.Packet;
 
 public enum EncAlgorithm {
     A256SIV("AES/CTR/NoPadding", tag -> new IvParameterSpec(tag, 0, 16));
@@ -22,11 +19,12 @@ public enum EncAlgorithm {
         this.parameterSpecFunction = specFunction;
     }
 
-    Cipher getCipher(int mode, Key key, byte[] siv) throws NoSuchPaddingException, NoSuchAlgorithmException,
-            InvalidAlgorithmParameterException, InvalidKeyException {
-        var cipher = Cipher.getInstance(cipherAlgorithm);
-        cipher.init(mode, key, parameterSpecFunction.apply(siv));
-        return cipher;
+    void encrypt(Key key, Packet packet) {
+        Crypto.encryptInPlace(cipherAlgorithm, key, packet.content, parameterSpecFunction.apply(packet.siv));
+    }
+
+    void decrypt(Key key, Packet packet) {
+        Crypto.decryptInPlace(cipherAlgorithm, key, packet.content, parameterSpecFunction.apply(packet.siv));
     }
 
     String getKeyAlgorithm() {

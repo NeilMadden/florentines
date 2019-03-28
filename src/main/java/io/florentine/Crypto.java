@@ -8,9 +8,12 @@ import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.NoSuchAlgorithmException;
 import java.security.PublicKey;
+import java.security.spec.AlgorithmParameterSpec;
 
+import javax.crypto.Cipher;
 import javax.crypto.KeyAgreement;
 import javax.crypto.Mac;
+import javax.crypto.NoSuchPaddingException;
 import javax.crypto.SecretKey;
 
 /**
@@ -121,6 +124,43 @@ final class Crypto {
             return encKey;
         }
     }
+
+    static byte[] mac(String macAlgorithm, Key macKey, byte[] data) {
+        try {
+            var mac = Mac.getInstance(macAlgorithm);
+            mac.init(macKey);
+            return mac.doFinal(data);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("Algorithm not supported: " + macAlgorithm, e);
+        } catch (InvalidKeyException e) {
+            throw new IllegalArgumentException("Invalid key", e);
+        }
+    }
+
+    static void encryptInPlace(String algorithm, Key key, byte[] data, AlgorithmParameterSpec iv) {
+        cipherInPlace(algorithm, Cipher.ENCRYPT_MODE, key, data, iv);
+    }
+
+    static void decryptInPlace(String algorithm, Key key, byte[] data, AlgorithmParameterSpec iv) {
+        cipherInPlace(algorithm, Cipher.DECRYPT_MODE, key, data, iv);
+    }
+
+    private static void cipherInPlace(String algorithm, int mode, Key key, byte[] data, AlgorithmParameterSpec iv) {
+        try {
+            var cipher = Cipher.getInstance(algorithm);
+            cipher.init(mode, key, iv);
+            cipher.doFinal(data, 0, data.length, data);
+        } catch (NoSuchAlgorithmException | NoSuchPaddingException e) {
+            throw new IllegalStateException("Algorithm not supported: " + algorithm, e);
+        } catch (InvalidAlgorithmParameterException e) {
+            throw new IllegalArgumentException("Invalid IV parameter", e);
+        } catch (InvalidKeyException e) {
+            throw new IllegalArgumentException("Invalid key", e);
+        } catch (GeneralSecurityException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
 
     private Crypto() {}
 }
