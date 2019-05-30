@@ -2,11 +2,14 @@ package io.florentine;
 
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Objects.requireNonNull;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
+import java.io.DataOutput;
 import java.io.DataOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -30,6 +33,8 @@ public class Florentine {
         this.encAlgorithm = encAlgorithm;
         this.packets = packets;
         this.tag = tag;
+
+        assert packets.get(0) instanceof Header;
     }
 
     public static Builder builder() {
@@ -61,14 +66,11 @@ public class Florentine {
              var out = new DataOutputStream(buffer)) {
 
             for (var packet : packets) {
-                out.write(packet.type);
-                out.writeShort(packet.bytes.length);
-                out.write(packet.bytes);
+                packet.write(out);
             }
 
-            out.write(Tag.TYPE);
-            out.writeShort(tag.length);
-            out.write(tag);
+            var tagPacket = new Tag(tag);
+            tagPacket.write(out);
             out.flush();
 
             return Base64url.encode(buffer.toByteArray());
@@ -80,43 +82,31 @@ public class Florentine {
     public static Florentine deserialize(MacAlgorithm macAlgorithm, EncAlgorithm encAlgorithm, String token) {
         try (var in = new DataInputStream(new ByteArrayInputStream(Base64url.decode(token)))) {
 
-            var header = readPacket(in);
-            if (header == null || header.type != Header.TYPE) {
-                throw new IllegalArgumentException("missing header");
-            }
+            var header = expect(in, Header.TYPE);
 
             var len = ((Header) header).header.getInt("len");
             var packets = new ArrayList<Packet>(len + 1);
             packets.add(header);
 
             for (int i = 0; i < len; ++i) {
-                var packet = readPacket(in);
-                if (packet == null) {
-                    throw new IllegalArgumentException("unexpected end of input");
-                }
-                if (packet.type != Public.TYPE && packet.type != Secret.TYPE) {
-                    throw new IllegalArgumentException("unexpected packet type: " + packet.type);
-                }
+                var packet = expect(in, Public.TYPE, Secret.TYPE);
                 packets.add(packet);
 
                 if (packet.type == Secret.TYPE) {
                     // Next packet must be the SIV
-                    var sivPacket = readPacket(in);
-                    if (sivPacket == null || sivPacket.type != Siv.TYPE) {
-                        throw new IllegalArgumentException("Missing SIV packet");
-                    }
+                    var sivPacket = expect(in, Siv.TYPE);
                     ((Secret) packet).siv = sivPacket.bytes;
                     packets.add(sivPacket);
                 }
             }
 
-            var packet = readPacket(in);
-            while (packet != null && packet.type == Caveat.TYPE) {
+            var packet = expect(in, Caveat.TYPE, Tag.TYPE);
+            while (packet.type == Caveat.TYPE) {
                 packets.add(packet);
-                packet = readPacket(in);
+                packet = expect(in, Caveat.TYPE, Tag.TYPE);
             }
 
-            if (packet == null || packet.type != Tag.TYPE) {
+            if (packet.type != Tag.TYPE) {
                 throw new IllegalArgumentException("missing authentication tag");
             }
 
@@ -140,26 +130,17 @@ public class Florentine {
             throw new IllegalArgumentException("algorithm mismatch");
         }
 
+        var packets = new ArrayList<>(this.packets);
+        packets.add(new Tag(tag));
+
         var header = packets.get(0);
         var computed = msgKeys.authenticate(header);
 
         var valid = true;
         for (var packet : packets.subList(1, packets.size())) {
-            if (packet.type == Secret.TYPE) {
-                msgKeys.decrypt((Secret) packet);
-            }
-
+            valid &= packet.process(msgKeys, computed);
             computed = macAlgorithm.authenticate(computed, packet);
-
-            if (packet.type == Secret.TYPE) {
-                if (!MessageDigest.isEqual(((Secret) packet).siv, encAlgorithm.getSiv(computed))) {
-                    valid = false;
-                }
-            }
         }
-
-        computed = Arrays.copyOf(computed, macAlgorithm.getTagLength());
-        valid = valid & MessageDigest.isEqual(computed, tag);
 
         if (!valid) {
             // Tag or SIV validation failed, so blow away all data to avoid leaking any secrets
@@ -169,6 +150,19 @@ public class Florentine {
         }
 
         return valid;
+    }
+
+    private static Packet expect(DataInputStream in, byte...packetTypes) throws IOException {
+        var packet = readPacket(in);
+        if (packet == null) {
+            throw new EOFException("unexpected end of input");
+        }
+        for (byte allowed : packetTypes) {
+            if (packet.type == allowed) {
+                return packet;
+            }
+        }
+        throw new IllegalArgumentException("unexpected packet type");
     }
 
     private static Packet readPacket(DataInputStream in) throws IOException {
@@ -263,9 +257,7 @@ public class Florentine {
         }
 
         public Florentine build(MessageKeys keys) {
-            if (keys == null) {
-                throw new IllegalArgumentException("no MAC key specified");
-            }
+            requireNonNull(keys, "MessageKeys");
 
             this.header.put("len", packets.size());
             var header = new Header(this.header);
@@ -281,7 +273,6 @@ public class Florentine {
                     florentine.add(new Siv(siv));
                 }
             }
-
 
             return florentine;
         }
@@ -303,6 +294,16 @@ public class Florentine {
             }
             this.type = type;
             this.bytes = bytes;
+        }
+
+        void write(DataOutput out) throws IOException {
+            out.write(type);
+            out.writeShort(bytes.length);
+            out.write(bytes);
+        }
+
+        boolean process(MessageKeys keys, byte[] tag) {
+            return true;
         }
     }
 
@@ -332,6 +333,12 @@ public class Florentine {
         Secret(byte[] content) {
             super(TYPE, content);
         }
+
+        @Override
+        boolean process(MessageKeys keys, byte[] tag) {
+            keys.decrypt(this);
+            return true;
+        }
     }
 
     static class Caveat extends Packet {
@@ -351,6 +358,11 @@ public class Florentine {
         Tag(byte[] tag) {
             super(TYPE, tag);
         }
+
+        @Override
+        boolean process(MessageKeys keys, byte[] computed) {
+            return MessageDigest.isEqual(bytes, Arrays.copyOf(computed, bytes.length));
+        }
     }
 
     static class Siv extends Packet {
@@ -358,6 +370,12 @@ public class Florentine {
 
         Siv(byte[] siv) {
             super(TYPE, siv);
+        }
+
+        @Override
+        boolean process(MessageKeys keys, byte[] tag) {
+            var computed = keys.getEncAlgorithm().getSiv(tag);
+            return MessageDigest.isEqual(bytes, computed);
         }
     }
 }

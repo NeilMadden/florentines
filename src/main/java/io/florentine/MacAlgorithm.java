@@ -1,5 +1,8 @@
 package io.florentine;
 
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.security.GeneralSecurityException;
 import java.security.Key;
 import java.util.Arrays;
@@ -25,15 +28,19 @@ public enum MacAlgorithm {
     }
 
     byte[] authenticate(Key key, Packet packet) {
-        try {
+        try (var buffer = new ByteArrayOutputStream();
+             var out = new DataOutputStream(buffer)) {
+
+            packet.write(out);
+            out.flush();
+
             Mac mac = Mac.getInstance(algorithm);
             mac.init(key);
-            mac.update(packet.type);
-            mac.update((byte) ((packet.bytes.length >>> 8) & 0xFF));
-            mac.update((byte) (packet.bytes.length & 0xFF));
-            return mac.doFinal(packet.bytes);
+            return mac.doFinal(buffer.toByteArray());
         } catch (GeneralSecurityException e) {
             throw new UnsupportedOperationException("Algorithm " + algorithm + " not supported");
+        } catch (IOException e) {
+            throw new RuntimeException(e);
         }
     }
 
