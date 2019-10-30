@@ -2,43 +2,29 @@ package io.florentine;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.security.Key;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 
-import javax.crypto.spec.SecretKeySpec;
-
 import org.json.JSONObject;
-import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
 public class FlorentineTest {
 
-    private MessageKeys msgKeys;
-
-    @BeforeClass
-    public void generateKeys() {
-        var keyBytes = new byte[32];
-        Florentine.SECURE_RANDOM.nextBytes(keyBytes);
-        var macKey = new SecretKeySpec(keyBytes, "HmacSHA512");
-        Florentine.SECURE_RANDOM.nextBytes(keyBytes);
-        var encKey = new SecretKeySpec(keyBytes, "AES");
-
-        msgKeys = new MessageKeys(macKey, MacAlgorithm.HS512, encKey, EncAlgorithm.A256SIV);
-    }
-
     @Test
-    public void testBlah() {
+    public void testIt() throws Exception {
+        Key key = Florentine.generateKey();
+        Florentine florentine = Florentine.create(key, new JSONObject().put("kid", "test"))
+                .addPublic("This is a public bit of data")
+                .addSecret("This is a secret bit of data")
+                .addCaveat(new JSONObject().put("exp", Instant.now().plus(5, ChronoUnit.MINUTES).getEpochSecond()));
 
-        var florentine = Florentine.builder()
-                .keyId("test")
-                .addPublic("Hello, World!")
-                .addSecret("Super secret message")
-                .build(msgKeys)
-                .addCaveat(new JSONObject().put("exp", Instant.now().plus(5, ChronoUnit.SECONDS).getEpochSecond()));
+        String str = florentine.serialize();
 
-        System.out.println("Florentine: " + florentine.serialize());
+        Florentine copy = Florentine.parse(str);
+        boolean valid = copy.verifySignature(key);
 
-        var decoded = Florentine.deserialize(MacAlgorithm.HS512, EncAlgorithm.A256SIV, florentine.serialize());
-        assertThat(decoded.verify(msgKeys)).isTrue();
+        assertThat(valid).isTrue();
     }
+
 }
