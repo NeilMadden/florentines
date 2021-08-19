@@ -3,6 +3,9 @@
 Florentines are [the best biscuit in the world](https://www.deliaonline.com/recipes/main-ingredient/chocolate/florentines)
 and also now a new auth token format that can be used instead of [JWT](https://jwt.io) or [Macaroons](http://macaroons.io).
 
+![Image of Florentine biscuits](https://photos1.blogger.com/hello/164/977/1024/IMG_3466.jpg)
+(Image credit: https://becksposhnosh.blogspot.com/2005/11/spiced-sesame-orange-florentines-with.html CC-By-NC-ND)
+
 Like JWTs, Florentines are a flexible format that supports authentication and encryption. Unlike JWTs, Florentines only
 support a single algorithm suite and provide no built-in way to specify an alternative, avoiding a whole class of security
 vulnerabilities that have plagued JWTs. Like Macaroons, Florentines
